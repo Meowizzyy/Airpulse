@@ -1,0 +1,252 @@
+name: airpulse
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+  image: airpulse-airflow:2.11.2
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow"
+    AIRFLOW_CONN_AIRPULSE_DB: "${NEON_DATABASE_URL}"
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./sql:/opt/airflow/sql:ro
+  user: "${AIRFLOW_UID:-50000}:0"
+  networks:
+    - airpulse-network
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init/00_create_airflow_db.sql:/docker-entrypoint-initdb.d/00_create_airflow_db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - airpulse-network
+
+  warehouse-init:
+    image: postgres:16-alpine
+    environment:
+      NEON_DATABASE_URL: ${NEON_DATABASE_URL}
+    volumes:
+      - ./sql/init:/sql/init:ro
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        psql "$${NEON_DATABASE_URL}" -v ON_ERROR_STOP=1 -f /sql/init/01_init_raw.sql
+        psql "$${NEON_DATABASE_URL}" -v ON_ERROR_STOP=1 -f /sql/init/02_init_silver.sql
+        psql "$${NEON_DATABASE_URL}" -v ON_ERROR_STOP=1 -f /sql/init/03_init_gold.sql
+    restart: "no"
+    networks:
+      - airpulse-network
+
+  warehouse-reset:
+    image: postgres:16-alpine
+    profiles: ["maintenance"]
+    environment:
+      NEON_DATABASE_URL: ${NEON_DATABASE_URL}
+    volumes:
+      - ./sql/init:/sql/init:ro
+      - ./sql/maintenance:/sql/maintenance:ro
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        psql "$${NEON_DATABASE_URL}" -v ON_ERROR_STOP=1 -f /sql/maintenance/reset_warehouse.sql
+        psql "$${NEON_DATABASE_URL}" -v ON_ERROR_STOP=1 -f /sql/init/01_init_raw.sql
+        psql "$${NEON_DATABASE_URL}" -v ON_ERROR_STOP=1 -f /sql/init/02_init_silver.sql
+        psql "$${NEON_DATABASE_URL}" -v ON_ERROR_STOP=1 -f /sql/init/03_init_gold.sql
+    restart: "no"
+    networks:
+      - airpulse-network
+
+  kafka:
+    image: apache/kafka:4.3.1
+    hostname: kafka
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - kafka_data:/tmp/kraft-combined-logs
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    networks:
+      - airpulse-network
+
+  kafka-init:
+    image: apache/kafka:4.3.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      - /bin/bash
+      - -c
+      - |
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:9092 \
+          --create \
+          --if-not-exists \
+          --topic airquality.raw.v1 \
+          --partitions 1 \
+          --replication-factor 1
+    restart: "no"
+    networks:
+      - airpulse-network
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    ports:
+      - "8081:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - airpulse-network
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        airflow users create \
+          --username airflow \
+          --password airflow \
+          --firstname Airflow \
+          --lastname Admin \
+          --role Admin \
+          --email airflow@example.com \
+          || true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      warehouse-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  ingestion-api:
+    build:
+      context: ./services
+    command: uvicorn app.api.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_RAW_TOPIC: airquality.raw.v1
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - airpulse-network
+
+  collector:
+    build:
+      context: ./services
+    command: python -m app.collector.main
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      INGESTION_API_URL: http://ingestion-api:8000/api/v1/air-quality-events
+      POLL_INTERVAL_SECONDS: ${COLLECTOR_POLL_INTERVAL_SECONDS:-3600}
+    depends_on:
+      ingestion-api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - airpulse-network
+
+  consumer:
+    build:
+      context: ./services
+    command: python -m app.kafka.consumer.main
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_RAW_TOPIC: airquality.raw.v1
+      KAFKA_CONSUMER_GROUP_ID: airquality-raw-consumer-v1
+      NEON_DATABASE_URL: ${NEON_DATABASE_URL}
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      warehouse-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks:
+      - airpulse-network
+
+volumes:
+  postgres_data:
+  kafka_data:
+
+networks:
+  airpulse-network:
+    driver: bridge
