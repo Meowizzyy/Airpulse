@@ -8,7 +8,7 @@ AirPulse — учебный Data Engineering проект для сбора, о�
 
 Цель AirPulse — построить end-to-end pipeline обработки данных о качестве воздуха и на практике применить основные инструменты Data Engineering:
 
-- REST API;
+- Fast API;
 - Apache Kafka;
 - PostgreSQL;
 - Apache Airflow;
@@ -212,9 +212,9 @@ http://localhost:8081
 
 ## Технологии
 
-**Data ingestion:** Python, Requests, FastAPI
+**Data ingestion:** Python, FastAPI
 
-**Streaming:** Apache Kafka, confluent-kafka
+**Streaming:** Apache Kafka
 
 **Database:** PostgreSQL / Neon PostgreSQL
 
@@ -222,7 +222,7 @@ http://localhost:8081
 
 **Transformation:** SQL, Python
 
-**Infrastructure:** Docker, Docker Compose
+**Infrastructure:** Docker
 
 **Visualization:** Yandex DataLens
 
